@@ -180,6 +180,40 @@ class ChunkAuditResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 分片认领（chunk-claims）
+# ---------------------------------------------------------------------------
+
+
+class ChunkClaimRequest(BaseModel):
+    """认领尚未接收的半开区间 [start, end)。"""
+
+    start: int = Field(..., ge=0, description="起始偏移（含）")
+    end: int = Field(..., ge=0, description="结束偏移（不含），半开区间")
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "ChunkClaimRequest":
+        if self.end <= self.start:
+            raise ValueError("invalid range: require start < end")
+        return self
+
+
+class ChunkClaimResponse(BaseModel):
+    claim_id: str = Field(..., description="认领记录 ID")
+    session_id: str
+    start: int = Field(..., description="认领区间起始偏移（含）")
+    end: int = Field(..., description="认领区间结束偏移（不含）")
+    # 明文随机令牌，仅在创建响应中返回这一次；服务端只存它的哈希。
+    token: str = Field(
+        ...,
+        description="分片提交令牌（X-Chunk-Claim 头携带；明文仅本次返回）",
+    )
+    created_at: str
+    expires_at: str = Field(
+        ..., description="令牌到期时间（默认 5 分钟）；到期后旧令牌不可用，区间可重领"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 受控下载票据
 # ---------------------------------------------------------------------------
 

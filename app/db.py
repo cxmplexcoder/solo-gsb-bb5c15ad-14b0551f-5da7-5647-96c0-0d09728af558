@@ -94,6 +94,7 @@ def read_only() -> Iterator[sqlite3.Connection]:
 #   v1：upload_sessions / chunks（首个发布版本）
 #   v2：download_tickets（受控下载票据）
 #   v3：idempotency_keys（创建会话幂等键）
+#   v4：chunk_claims（分片认领：未收半开区间的临时独占令牌）
 # 全部 DDL 均为 IF NOT EXISTS，重复执行安全；老库数据在迁移中保留。
 # ---------------------------------------------------------------------------
 
@@ -167,8 +168,39 @@ CREATE INDEX IF NOT EXISTS idx_idempotency_keys_session
     ON idempotency_keys(session_id);
 """
 
+MIGRATION_4 = """
+-- 分片认领：上传中会话对“尚未接收的半开区间”的临时独占登记。
+-- 与票据一致，明文令牌仅在创建响应中返回一次，库里只存 SHA-256(token)。
+-- status: active=有效，consumed=已被成功提交消费；过期以 expires_at 判定，
+-- 不做状态翻转（时钟统一），过期/消费后的行都不再算作有效认领，
+-- 仅作为审计记录保留。会话删除时经 ON DELETE CASCADE 一并删除。
+CREATE TABLE IF NOT EXISTS chunk_claims (
+    id            TEXT PRIMARY KEY,
+    session_id    TEXT NOT NULL
+                    REFERENCES upload_sessions(id) ON DELETE CASCADE,
+    start_offset  INTEGER NOT NULL CHECK (start_offset >= 0),
+    end_offset    INTEGER NOT NULL CHECK (end_offset > start_offset),
+    token_hash    TEXT NOT NULL,
+    status        TEXT NOT NULL
+                    CHECK (status IN ('active', 'consumed')),
+    created_at    TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,
+    consumed_at   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunk_claims_session_interval
+    ON chunk_claims(session_id, status, start_offset, end_offset);
+CREATE INDEX IF NOT EXISTS idx_chunk_claims_expires
+    ON chunk_claims(status, expires_at);
+"""
+
 # 版本号 -> 迁移脚本；版本号同时写入 PRAGMA user_version。
-_MIGRATIONS: dict[int, str] = {1: MIGRATION_1, 2: MIGRATION_2, 3: MIGRATION_3}
+_MIGRATIONS: dict[int, str] = {
+    1: MIGRATION_1,
+    2: MIGRATION_2,
+    3: MIGRATION_3,
+    4: MIGRATION_4,
+}
 LATEST_USER_VERSION = max(_MIGRATIONS)
 
 
