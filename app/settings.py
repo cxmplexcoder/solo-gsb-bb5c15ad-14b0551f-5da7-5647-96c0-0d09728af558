@@ -29,6 +29,7 @@ def reload() -> None:
     """从环境变量重新加载全部配置（主要供测试使用）。"""
     global data_dir, database_url, ttl_seconds, cleanup_interval_seconds
     global max_chunk_bytes, max_upload_bytes, max_filename_length
+    global chunk_claim_ttl_seconds
 
     data_dir = Path(_env_str("DATA_DIR", "/data")).resolve()
     database_url = _env_str("DATABASE_URL", f"sqlite:///{data_dir / 'resumable.db'}")
@@ -39,6 +40,8 @@ def reload() -> None:
     # 0 表示不限制整文件大小。
     max_upload_bytes = max(0, _env_int("MAX_UPLOAD_BYTES", 100 * 1024 * 1024 * 1024))
     max_filename_length = max(1, _env_int("MAX_FILENAME_LENGTH", 255))
+    # 分片认领令牌的有效期（秒），默认 5 分钟。
+    chunk_claim_ttl_seconds = max(1, _env_int("CHUNK_CLAIM_TTL_SECONDS", 300))
 
 
 data_dir: Path
@@ -48,5 +51,6 @@ cleanup_interval_seconds: int
 max_chunk_bytes: int
 max_upload_bytes: int
 max_filename_length: int
+chunk_claim_ttl_seconds: int
 
 reload()

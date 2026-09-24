@@ -12,6 +12,7 @@ services:
       CLEANUP_INTERVAL_SECONDS: "300"
       MAX_CHUNK_BYTES: "67108864"
       MAX_UPLOAD_BYTES: "107374182400"
+      CHUNK_CLAIM_TTL_SECONDS: "300"
     volumes:
       - resumable-data:/data
     restart: unless-stopped

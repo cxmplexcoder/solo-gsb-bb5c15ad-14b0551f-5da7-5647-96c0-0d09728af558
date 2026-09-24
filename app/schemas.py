@@ -88,6 +88,40 @@ class ChunkResponse(BaseModel):
     expires_at: str
 
 
+# ---------------------------------------------------------------------------
+# 分片认领（chunk-claims）
+# ---------------------------------------------------------------------------
+
+
+class ChunkClaimRequest(BaseModel):
+    """认领一个尚未接收的半开区间 [start, end)。"""
+
+    start: int = Field(..., ge=0, description="起始偏移（含）")
+    end: int = Field(..., ge=0, description="结束偏移（不含），半开区间 [start, end)")
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "ChunkClaimRequest":
+        if self.end <= self.start:
+            raise ValueError("invalid range: require start < end")
+        return self
+
+
+class ChunkClaimResponse(BaseModel):
+    claim_id: str = Field(..., description="认领 ID（令牌凭证的前半段）")
+    session_id: str
+    start: int
+    end: int
+    created_at: str
+    expires_at: str
+    claim: str = Field(
+        ...,
+        description=(
+            "认领令牌 <claim_id>.<token>，明文仅本次返回；提交该区间分片时"
+            "放入 X-Chunk-Claim 请求头，请像密码一样保管"
+        ),
+    )
+
+
 class CopyChunkRequest(BaseModel):
     """服务端复制分片请求：从已完成来源会话的成品中复制一段。"""
 

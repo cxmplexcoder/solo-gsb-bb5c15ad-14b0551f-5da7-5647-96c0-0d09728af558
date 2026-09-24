@@ -3,9 +3,10 @@
 接口概览（前缀 /api/v1）：
   POST   /sessions                      创建上传会话（可选 Idempotency-Key 幂等创建）
   GET    /sessions/{id}                 查询状态与缺失区间
-  PUT    /sessions/{id}/chunks          提交二进制分片（?start=&end=，半开区间；可选 X-Chunk-SHA256 逐片校验）
+  PUT    /sessions/{id}/chunks          提交二进制分片（?start=&end=，半开区间；可选 X-Chunk-SHA256 逐片校验；可选 X-Chunk-Claim 认领令牌）
   PUT    /sessions/{id}/chunks/repair   已收分片原位修复（区间必须与某已登记分片完全一致；可选 X-Chunk-SHA256）
   POST   /sessions/{id}/chunks/audit    上传中会话的分片完整性诊断（按清单逐条核对磁盘分片，只读）
+  POST   /sessions/{id}/chunk-claims    认领尚未接收的半开区间，返回一次性随机令牌（5 分钟有效）
   POST   /sessions/{id}/copy-chunk      从已完成来源会话的成品服务端复制一段为目标会话分片
   POST   /sessions/{id}/complete        原子完成（区间全覆盖 + SHA-256 校验）
   DELETE /sessions/{id}                 放弃会话
@@ -30,7 +31,7 @@ from anyio.to_thread import run_sync
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, RedirectResponse
 
-from . import db, idempotency, schemas, settings, storage
+from . import claims, db, idempotency, schemas, settings, storage
 from .cleanup import start_janitor
 from .locks import session_locks
 
@@ -96,6 +97,10 @@ def _load_session(session_id: str) -> sqlite3.Row:
                 "UPDATE upload_sessions SET status = 'expired' "
                 "WHERE id = ? AND status = 'uploading'",
                 (session_id,),
+            )
+            # 会话结束即认领失效：同事务删除其全部认领令牌。
+            tx.execute(
+                "DELETE FROM chunk_claims WHERE session_id = ?", (session_id,)
             )
         shutil.rmtree(storage.parts_dir(session_id), ignore_errors=True)
         raise _http(410, "session expired")
@@ -258,11 +263,194 @@ def abort_session(session_id: str) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# 分片认领（chunk-claims）
+#
+# 上传中会话可认领一个尚未接收的半开区间，获得一次性随机令牌（默认 5 分钟
+# 有效）。认领用于多上传者协调：有效（未过期、未消费）认领覆盖的区间内，
+# 只有持令牌的请求且区间与认领完全一致才能提交分片；未认领区间沿用原有
+# 行为。不变式：有效认领覆盖的区间必然尚未接收——
+#   * 认领创建在单个 IMMEDIATE 事务内复核会话状态、已收区间与有效认领；
+#   * 分片落盘登记（PUT /chunks 与 copy-chunk）在同一事务内复核认领规则，
+#     成功提交即消费（删除）认领，失败/断流回滚不消费；
+#   * 会话完成/过期/放弃时认领一并失效（显式删除或外键级联）。
+# 服务端只保存令牌明文的 SHA-256，明文仅在认领响应中返回一次。
+# ---------------------------------------------------------------------------
+
+
+def _check_chunk_claim(
+    conn: sqlite3.Connection,
+    session_id: str,
+    start: int,
+    end: int,
+    presented: tuple[str, str] | None,
+) -> str | None:
+    """分片区间与认领规则的权威校验；调用方必须持有该会话的锁。
+
+    ``presented`` 为请求解析出的 ``(claim_id, token_hash)``，未带头为 None。
+    返回成功提交时应消费的认领 id；无需消费时返回 None。
+    可在普通连接（预校验）或事务连接（登记前复核）上执行。
+    """
+    now_iso = storage.iso(storage.utcnow())
+    if presented is not None:
+        claim_id, token_hash = presented
+        row = conn.execute(
+            "SELECT * FROM chunk_claims "
+            "WHERE id = ? AND session_id = ? AND token_hash = ?",
+            (claim_id, session_id, token_hash),
+        ).fetchone()
+        if row is None:
+            raise _http(403, "invalid X-Chunk-Claim credential")
+        if row["expires_at"] <= now_iso:
+            # 到期后旧令牌不可用；区间可在过期后重新认领或直接提交。
+            raise _http(410, "chunk claim expired")
+        if row["start_offset"] != start or row["end_offset"] != end:
+            raise _http(
+                409,
+                "chunk range does not exactly match the claim",
+                claim_start=row["start_offset"],
+                claim_end=row["end_offset"],
+            )
+        # 有效认领互不相交，区间与认领完全一致时不可能再撞上其他有效认领。
+        return claim_id
+
+    blocking = conn.execute(
+        "SELECT start_offset, end_offset FROM chunk_claims "
+        "WHERE session_id = ? AND expires_at > ? "
+        "AND start_offset < ? AND end_offset > ?",
+        (session_id, now_iso, end, start),
+    ).fetchone()
+    if blocking is not None:
+        raise _http(
+            409,
+            "chunk range intersects an active claim",
+            claim_start=blocking["start_offset"],
+            claim_end=blocking["end_offset"],
+        )
+    return None
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/chunk-claims",
+    status_code=201,
+    response_model=schemas.ChunkClaimResponse,
+    tags=["claims"],
+)
+def create_chunk_claim(session_id: str, body: schemas.ChunkClaimRequest) -> dict:
+    """认领一个尚未接收的半开区间，返回一次性随机令牌（默认 5 分钟有效）。"""
+    start, end = body.start, body.end
+    with session_locks.get(session_id):
+        row = _load_session(session_id)
+        if row["status"] == "completed":
+            raise _http(409, "session already completed; no more chunks accepted")
+        total = row["total_size"]
+        if end > total:
+            raise _http(
+                400,
+                "claim range exceeds total_size",
+                start=start,
+                end=end,
+                total_size=total,
+            )
+        if settings.max_chunk_bytes and end - start > settings.max_chunk_bytes:
+            raise _http(
+                413,
+                "claimed range larger than MAX_CHUNK_BYTES",
+                max_chunk_bytes=settings.max_chunk_bytes,
+            )
+
+        claim_id = uuid.uuid4().hex
+        token = claims.new_token()
+        now = storage.utcnow()
+        now_iso = storage.iso(now)
+        expires_iso = storage.iso(
+            now + timedelta(seconds=settings.chunk_claim_ttl_seconds)
+        )
+
+        # 单个 IMMEDIATE 事务内复核会话状态、已收区间与有效认领后登记：
+        # 并发认领同一区间在此串行，后到者看到已提交的认领而冲突失败。
+        with db.immediate() as tx:
+            current = tx.execute(
+                "SELECT * FROM upload_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if current is None:
+                raise _http(404, "session not found")
+            if current["status"] in ("aborted", "expired") or (
+                current["status"] == "uploading"
+                and storage.parse_iso(current["expires_at"]) <= storage.utcnow()
+            ):
+                raise _http(410, "session no longer active")
+            if current["status"] == "completed":
+                raise _http(409, "session already completed")
+
+            # 顺手回收本会话已到期的旧认领：过期区间自此可重新认领。
+            tx.execute(
+                "DELETE FROM chunk_claims WHERE session_id = ? AND expires_at <= ?",
+                (session_id, now_iso),
+            )
+
+            # 只能认领尚未接收的区间（与已收区间相邻允许）。
+            if storage.overlaps_any(start, end, _existing_intervals(tx, session_id)):
+                raise _http(
+                    409,
+                    "claim range overlaps an already received range",
+                    start=start,
+                    end=end,
+                )
+
+            # 相交的有效认领只能有一个；过期认领已在上面回收，不参与判定。
+            blocking = tx.execute(
+                "SELECT start_offset, end_offset FROM chunk_claims "
+                "WHERE session_id = ? AND expires_at > ? "
+                "AND start_offset < ? AND end_offset > ?",
+                (session_id, now_iso, end, start),
+            ).fetchone()
+            if blocking is not None:
+                raise _http(
+                    409,
+                    "range intersects an active claim",
+                    claim_start=blocking["start_offset"],
+                    claim_end=blocking["end_offset"],
+                )
+
+            tx.execute(
+                "INSERT INTO chunk_claims "
+                "(id, session_id, start_offset, end_offset, token_hash, "
+                "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    claim_id,
+                    session_id,
+                    start,
+                    end,
+                    claims.token_hash(token),
+                    now_iso,
+                    expires_iso,
+                ),
+            )
+
+    return {
+        "claim_id": claim_id,
+        "session_id": session_id,
+        "start": start,
+        "end": end,
+        "created_at": now_iso,
+        "expires_at": expires_iso,
+        # 令牌明文只出现这一次；库里只有它的 SHA-256。
+        "claim": f"{claim_id}.{token}",
+    }
+
+
+# ---------------------------------------------------------------------------
 # 分片提交
 # ---------------------------------------------------------------------------
 
-def _prepare_chunk(session_id: str, start: int, end: int, declared_length: int) -> None:
-    """在线程池中执行：会话状态、越界、重叠与大小的首次权威校验，并滑动 TTL。"""
+def _prepare_chunk(
+    session_id: str,
+    start: int,
+    end: int,
+    declared_length: int,
+    presented_claim: tuple[str, str] | None = None,
+) -> None:
+    """在线程池中执行：会话状态、越界、重叠、认领与大小的首次权威校验，并滑动 TTL。"""
     with session_locks.get(session_id):
         row = _load_session(session_id)
         if row["status"] == "completed":
@@ -304,6 +492,8 @@ def _prepare_chunk(session_id: str, start: int, end: int, declared_length: int) 
                 start=start,
                 end=end,
             )
+        # 认领规则首次校验（接收请求体之前拒绝，权威复核在提交事务内）。
+        _check_chunk_claim(conn, session_id, start, end, presented_claim)
         now = storage.utcnow()
         with db.immediate() as tx:
             tx.execute(
@@ -317,8 +507,14 @@ def _prepare_chunk(session_id: str, start: int, end: int, declared_length: int) 
             )
 
 
-def _commit_chunk(session_id: str, start: int, end: int, tmp_file: str) -> dict:
-    """落盘临时分片并在单个 IMMEDIATE 事务中二次校验 + 登记。"""
+def _commit_chunk(
+    session_id: str,
+    start: int,
+    end: int,
+    tmp_file: str,
+    presented_claim: tuple[str, str] | None = None,
+) -> dict:
+    """落盘临时分片并在单个 IMMEDIATE 事务中二次校验 + 登记（成功即消费认领）。"""
     tmp_path = Path(tmp_file)
     with session_locks.get(session_id):
         try:
@@ -347,6 +543,11 @@ def _commit_chunk(session_id: str, start: int, end: int, tmp_file: str) -> dict:
                         end=end,
                     )
 
+                # 事务内复核认领规则：预校验之后认领可能已过期/被消费/新建。
+                consume_claim_id = _check_chunk_claim(
+                    tx, session_id, start, end, presented_claim
+                )
+
                 # 事务内移动文件：若后续 SQL 失败，事务回滚且下面的 except 会删除文件。
                 final = storage.part_path(session_id, start, end)
                 final.parent.mkdir(parents=True, exist_ok=True)
@@ -369,6 +570,12 @@ def _commit_chunk(session_id: str, start: int, end: int, tmp_file: str) -> dict:
                     "last_access_at = ?, expires_at = ? WHERE id = ?",
                     (end - start, now_iso, expires_iso, session_id),
                 )
+                # 成功提交消费令牌：与分片登记同一事务，回滚则不消费。
+                if consume_claim_id is not None:
+                    tx.execute(
+                        "DELETE FROM chunk_claims WHERE id = ?",
+                        (consume_claim_id,),
+                    )
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise
@@ -661,6 +868,15 @@ async def put_chunk(
             "摘要不匹配返回 422，且不落盘、不登记区间，重传正确内容即可恢复。"
         ),
     ),
+    chunk_claim: str | None = Header(
+        default=None,
+        alias="X-Chunk-Claim",
+        description=(
+            "可选：分片认领令牌 <claim_id>.<token>（POST chunk-claims 返回）。"
+            "区间与有效认领相交时必须携带：令牌匹配且区间与认领完全一致才接受，"
+            "成功提交即消费令牌；未认领区间不携带该头，行为不变。"
+        ),
+    ),
 ) -> dict:
     if end <= start:
         raise _http(
@@ -697,9 +913,23 @@ async def put_chunk(
             )
     else:
         expected_chunk_digest = None
+    # 认领头同样在读体之前解析：格式非法直接 400，不消耗请求体。
+    presented_claim: tuple[str, str] | None = None
+    if chunk_claim is not None:
+        try:
+            claim_id, claim_token = claims.parse_credential(chunk_claim)
+        except ValueError:
+            raise _http(
+                400,
+                "invalid X-Chunk-Claim header",
+                requirement=claims.CREDENTIAL_REQUIREMENT,
+            )
+        presented_claim = (claim_id, claims.token_hash(claim_token))
 
     # 首次校验 + TTL 滑动（阻塞 DB 操作丢到线程池，避免卡住事件循环）。
-    await run_sync(_prepare_chunk, session_id, start, end, declared_length)
+    await run_sync(
+        _prepare_chunk, session_id, start, end, declared_length, presented_claim
+    )
 
     # 流式落临时文件，弱网下也不会把整分片读进内存。
     # 提供 X-Chunk-SHA256 时同步增量计算摘要：校验不过只删除临时文件，
@@ -746,7 +976,9 @@ async def put_chunk(
                 actual=actual_chunk_digest,
             )
 
-    return await run_sync(_commit_chunk, session_id, start, end, str(tmp))
+    return await run_sync(
+        _commit_chunk, session_id, start, end, str(tmp), presented_claim
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -935,6 +1167,11 @@ def _copy_chunk(
                 start=target_start,
                 end=target_end,
             )
+        # 认领区间只能由持令牌者经 PUT /chunks 提交；copy-chunk 不携带令牌，
+        # 与有效认领相交的目标区间在此拒绝（权威复核在提交事务内）。
+        _check_chunk_claim(
+            conn, target_session_id, target_start, target_end, None
+        )
 
         # 预校验全部通过才复制（仍在双锁内）：流式切片到 tmp，
         # 成品被并发截断/替换会在此抛错，临时文件由辅助函数自行清理。
@@ -981,6 +1218,11 @@ def _copy_chunk(
                         start=target_start,
                         end=target_end,
                     )
+
+                # 事务内复核认领规则：复制期间目标区间可能已被他人认领。
+                _check_chunk_claim(
+                    tx, target_session_id, target_start, target_end, None
+                )
 
                 # 来源资格在事务内复查：来源若已被并发放弃删除，此处拿到
                 # 状态变化/成品缺失，事务回滚，不登记任何分片。
@@ -1121,6 +1363,10 @@ def complete_session(session_id: str) -> dict:
                     "status = 'completed', bytes_received = ?, "
                     "completed_at = ?, last_access_at = ? WHERE id = ?",
                     (row["total_size"], now_iso, now_iso, session_id),
+                )
+                # 会话结束即认领失效：与状态翻转同事务删除全部认领令牌。
+                tx.execute(
+                    "DELETE FROM chunk_claims WHERE session_id = ?", (session_id,)
                 )
         except BaseException:
             storage.artifact_path(session_id).unlink(missing_ok=True)

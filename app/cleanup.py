@@ -44,6 +44,11 @@ def expire_due_sessions(now: storage.datetime | None = None) -> list[str]:
                         "UPDATE upload_sessions SET status = 'expired' WHERE id = ?",
                         (session_id,),
                     )
+                    # 会话结束即认领失效：同事务删除其全部认领令牌。
+                    tx.execute(
+                        "DELETE FROM chunk_claims WHERE session_id = ?",
+                        (session_id,),
+                    )
                 else:
                     continue
             # 状态落库后再删磁盘分片；过期会话不会再复活，残留分片可由后续轮次兜底。
@@ -79,11 +84,26 @@ def sweep_completed_parts() -> None:
                 shutil.rmtree(child, ignore_errors=True)
 
 
+def sweep_expired_claims(now: storage.datetime | None = None) -> int:
+    """删除所有已到期的分片认领行，返回删除条数。
+
+    过期认领在认领创建/分片提交时本就不再被接受（按 expires_at 即时判定），
+    这里只回收行空间；与并发提交经 BEGIN IMMEDIATE 串行，互不影响正确性。
+    """
+    now_iso = storage.iso(now or storage.utcnow())
+    with db.immediate() as tx:
+        cur = tx.execute(
+            "DELETE FROM chunk_claims WHERE expires_at <= ?", (now_iso,)
+        )
+    return cur.rowcount
+
+
 def run_cleanup(now: storage.datetime | None = None) -> list[str]:
     """执行一轮完整清理，返回被过期的会话 id（供测试调用）。"""
     storage.ensure_dirs()
     expired = expire_due_sessions(now=now)
     sweep_completed_parts()
+    sweep_expired_claims(now=now)
     storage.sweep_old_tempfiles(
         (now or storage.utcnow()) - timedelta(hours=1)
     )
